@@ -1,0 +1,322 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Improved Breakout/Retest Strategy v2.0
+
+//@version=5
+strategy("Breakout/Retest 2.0 Improved", overlay=true, initial_capital=1000, 
+         default_qty_type=strategy.percent_of_equity, default_qty_value=100, 
+         pyramiding=0, slippage=3, commission_type=strategy.commission.percent, 
+         commission_value=0.02)
+
+// ============================================================
+//                    INPUT PARAMETERS
+// ============================================================
+grp_fractals = "Fractal Settings"
+left_bars  = input.int(5, title="Left Bars", group=grp_fractals, minval=1)
+right_bars = input.int(5, title="Right Bars", group=grp_fractals, minval=1)
+
+grp_rr = "Risk Management"
+sl_buffer_pct = input.float(0.1, title="SL Buffer (%)", group=grp_rr, step=0.05) / 100
+rr_ratio = input.float(2.0, title="Risk/Reward Ratio", group=grp_rr, step=0.1, minval=0.5, maxval=5.0)
+max_risk_pct = input.float(2.0, title="Max Risk per Trade (%)", group=grp_rr, step=0.1)
+
+grp_trend = "Trend Filter"
+use_trend_filter = input.bool(true, title="Use Trend Filter", group=grp_trend)
+ema_fast_len = input.int(21, title="Fast EMA Length", group=grp_trend)
+ema_slow_len = input.int(50, title="Slow EMA Length", group=grp_trend)
+
+grp_volume = "Volume Filter"
+use_volume_filter = input.bool(true, title="Use Volume Filter", group=grp_volume)
+vol_mult = input.float(1.2, title="Volume Multiplier", group=grp_volume, step=0.1)
+
+grp_session = "Session Filter"
+use_session_filter = input.bool(true, title="Use Session Filter", group=grp_session)
+session_time = input.session("0900-1600", title="Trading Session (EST)", group=grp_session)
+
+grp_retest = "Retest Settings"
+retest_lookback = input.int(10, title="Max Bars for Retest", group=grp_retest)
+retest_tolerance = input.float(0.2, title="Retest Zone Tolerance (%)", group=grp_retest, step=0.05) / 100
+
+grp_visual = "Visual Settings"
+show_signals = input.bool(true, title="Show Signal Labels", group=grp_visual)
+show_levels = input.bool(true, title="Show S/R Levels", group=grp_visual)
+
+// ============================================================
+//                    INDICATOR CALCULATIONS
+// ============================================================
+
+// 1. Fractal Pivots (Support & Resistance)
+pivot_high = ta.pivothigh(high, left_bars, right_bars)
+pivot_low  = ta.pivotlow(low, left_bars, right_bars)
+
+// 2. Trend Filter (EMA Crossover)
+ema_fast = ta.ema(close, ema_fast_len)
+ema_slow = ta.ema(close, ema_slow_len)
+uptrend = ema_fast > ema_slow
+downtrend = ema_fast < ema_slow
+trend_ok = use_trend_filter ? uptrend : true
+
+// 3. Volume Filter
+vol_sma = ta.sma(volume, 20)
+vol_ok = use_volume_filter ? (volume > vol_sma * vol_mult) : true
+
+// 4. Session Filter
+in_session = not use_session_filter or time(timeframe.period, session_time)
+
+// ============================================================
+//                    STATE MANAGEMENT
+// ============================================================
+// Using a cleaner state machine approach
+
+var int setup_bar = na           // Bar when setup started
+var float setup_resistance = na  // Active resistance level
+var float setup_support = na     // Active support level
+var bool breakout_confirmed = false
+var bool retest_valid = false
+var float retest_low = na        // Track lowest point during retest
+
+// Track valid levels with proper offset handling
+resistance_level = valuewhen(pivot_high, high[right_bars], 0)
+support_level = valuewhen(pivot_low, low[right_bars], 0)
+
+// Current active levels (most recent)
+var float active_resistance = na
+var float active_support = na
+var float prev_resistance = na   // Store previous resistance for retest
+
+// Update levels when new pivots form
+if not na(pivot_high)
+    prev_resistance := active_resistance
+    active_resistance := pivot_high
+    
+if not na(pivot_low)
+    active_support := pivot_low
+
+// ============================================================
+//                    BREAKOUT DETECTION
+// ============================================================
+
+// Breakout: Close above resistance with confirmation
+breakout_bar = bar_index
+breakout_price = close
+
+// Detect clean breakout (close above resistance)
+breakout_occurred = not na(active_resistance) and close > active_resistance and close[1] <= active_resistance
+
+// Track breakout state
+var bool in_breakout = false
+var int breakout_bar_idx = na
+
+if breakout_occurred and not in_breakout
+    in_breakout := true
+    breakout_bar_idx := bar_index
+    breakout_confirmed := true
+
+// Reset breakout if too many bars pass or new resistance forms
+if in_breakout and (bar_index - breakout_bar_idx > retest_lookback)
+    in_breakout := false
+    breakout_confirmed := false
+    
+if not na(pivot_high) and in_breakout
+    // New resistance formed, reset state
+    in_breakout := false
+    breakout_confirmed := false
+
+// ============================================================
+//                    RETEST DETECTION (FIXED LOGIC)
+// ============================================================
+
+// A proper retest happens when:
+// 1. Breakout has occurred
+// 2. Price comes back to test the broken resistance (now support)
+// 3. Price bounces off this level
+
+retest_zone_upper = active_resistance * (1 + retest_tolerance)
+retest_zone_lower = active_resistance * (1 - retest_tolerance)
+
+// Check if price entered retest zone
+in_retest_zone = in_breakout and low <= retest_zone_upper and low >= retest_zone_lower
+
+// Check for bounce from retest zone (bullish reaction)
+retest_bounce = in_retest_zone and close > open and close > active_resistance
+
+// Valid retest signal
+valid_retest_signal = in_breakout and retest_bounce
+
+// ============================================================
+//                    ENTRY CONDITIONS
+// ============================================================
+
+// Combine all filters for entry
+long_condition_breakout = not in_breakout and 
+                          not na(active_resistance) and 
+                          not na(active_support) and
+                          trend_ok and 
+                          vol_ok and 
+                          in_session
+
+long_condition_retest = in_breakout and 
+                        valid_retest_signal and
+                        trend_ok and 
+                        vol_ok and 
+                        in_session
+
+// ============================================================
+//                    POSITION SIZING
+// ============================================================
+
+// Calculate position size based on risk percentage
+calc_position_size() =>
+    if not na(active_support) and not na(active_resistance)
+        risk_per_share = active_resistance - (active_support * (1 - sl_buffer_pct))
+        if risk_per_share > 0
+            risk_amount = strategy.equity * (max_risk_pct / 100)
+            shares = risk_amount / risk_per_share
+            math.floor(shares)
+        else
+            0
+    else
+        0
+
+// ============================================================
+//                    EXECUTION LOGIC
+// ============================================================
+
+// Cancel all pending orders first
+strategy.cancel_all()
+
+// Entry Logic with improved order types
+if strategy.position_size == 0
+    // STAGE 1: Breakout Entry (Buy Stop)
+    if long_condition_breakout
+        shares = calc_position_size()
+        if shares > 0
+            strategy.entry("Breakout", strategy.long, qty=shares, stop=active_resistance)
+    
+    // STAGE 2: Retest Entry (Market order on valid retest confirmation)
+    if long_condition_retest
+        shares = calc_position_size()
+        if shares > 0
+            strategy.entry("Retest", strategy.long, qty=shares)
+
+// ============================================================
+//                    EXIT LOGIC
+// ============================================================
+
+var float trade_sl = na
+var float trade_tp = na
+var float trade_entry = na
+
+// Set exits when position opens
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    trade_entry := strategy.position_avg_price
+    
+    // Find most recent support below entry for SL
+    sl_level = na
+    if not na(active_support) and active_support < trade_entry
+        sl_level := active_support * (1 - sl_buffer_pct)
+    else
+        // Fallback: use percentage below entry
+        sl_level := trade_entry * (1 - 0.02)
+    
+    trade_sl := sl_level
+    
+    // Calculate risk
+    risk_distance = trade_entry - trade_sl
+    
+    // Set TP based on RR ratio
+    trade_tp := trade_entry + (risk_distance * rr_ratio)
+
+// Execute exits
+if strategy.position_size > 0
+    // Hard stop and target
+    strategy.exit("Exit", stop=trade_sl, limit=trade_tp, 
+                  comment_loss="SL Hit", comment_profit="TP Hit")
+    
+    // Trailing stop after 1R profit
+    if high > trade_entry + (trade_entry - trade_sl)
+        trail_offset = (trade_entry - trade_sl) * 0.5
+        strategy.exit("Trail", stop=high - trail_offset, 
+                      comment_loss="Trail Stop")
+
+// ============================================================
+//                    VISUAL PLOTTING
+// ============================================================
+
+// Trend EMAs
+plot(ema_fast, color=color.blue, title="Fast EMA", linewidth=1)
+plot(ema_slow, color=color.orange, title="Slow EMA", linewidth=1)
+
+// Support & Resistance Levels
+plot(show_levels ? active_resistance : na, color=color.red, 
+     style=plot.style_stepline, linewidth=2, title="Resistance")
+plot(show_levels ? active_support : na, color=color.green, 
+     style=plot.style_stepline, linewidth=2, title="Support")
+
+// Retest Zone
+plot(show_levels and in_breakout ? retest_zone_upper : na, 
+     color=color.new(color.blue, 70), style=plot.style_linebr, linewidth=1, title="Retest Upper")
+plot(show_levels and in_breakout ? retest_zone_lower : na, 
+     color=color.new(color.blue, 70), style=plot.style_linebr, linewidth=1, title="Retest Lower")
+
+// Trade Levels when in position
+plot(strategy.position_size > 0 ? trade_sl : na, color=color.red, 
+     style=plot.style_linebr, linewidth=2, title="Stop Loss")
+plot(strategy.position_size > 0 ? trade_tp : na, color=color.green, 
+     style=plot.style_linebr, linewidth=2, title="Take Profit")
+
+// Signal Labels
+plotshape(show_signals and long_condition_breakout, title="Breakout Setup", 
+          location=location.belowbar, color=color.blue, style=shape.labelup, 
+          text="SETUP", textcolor=color.white)
+          
+plotshape(show_signals and long_condition_retest, title="Retest Signal", 
+          location=location.belowbar, color=color.green, style=shape.labelup, 
+          text="RETEST", textcolor=color.white)
+
+plotshape(show_signals and strategy.position_size > 0 and strategy.position_size[1] == 0, 
+          title="Entry", location=location.belowbar, color=color.lime, 
+          style=shape.labelup, text="ENTRY", textcolor=color.black)
+
+// Background for session
+bgcolor(use_session_filter and in_session ? color.new(color.green, 95) : na, title="Session BG")
+
+// ============================================================
+//                    ALERTS
+// ============================================================
+
+alertcondition(long_condition_breakout, title="Breakout Setup", 
+               message="Breakout setup detected at {{ticker}}")
+alertcondition(long_condition_retest, title="Retest Signal", 
+               message="Retest entry signal at {{ticker}}")
+alertcondition(strategy.position_size > 0 and strategy.position_size[1] == 0, 
+               title="Position Opened", message="Long position opened at {{ticker}}")
+
+// ============================================================
+//                    INFO TABLE
+// ============================================================
+
+var table info_table = table.new(position.top_right, 2, 6, border_width=1)
+
+if barstate.islast
+    table.cell(info_table, 0, 0, "Metric", bgcolor=color.gray, text_color=color.white)
+    table.cell(info_table, 1, 0, "Value", bgcolor=color.gray, text_color=color.white)
+    
+    table.cell(info_table, 0, 1, "Trend", text_color=color.white)
+    table.cell(info_table, 1, 1, uptrend ? "UP ↑" : "DOWN ↓", 
+               bgcolor=uptrend ? color.green : color.red, text_color=color.white)
+    
+    table.cell(info_table, 0, 2, "Volume", text_color=color.white)
+    table.cell(info_table, 1, 2, vol_ok ? "OK ✓" : "LOW ✗", 
+               bgcolor=vol_ok ? color.green : color.red, text_color=color.white)
+    
+    table.cell(info_table, 0, 3, "Session", text_color=color.white)
+    table.cell(info_table, 1, 3, in_session ? "OPEN ✓" : "CLOSED ✗", 
+               bgcolor=in_session ? color.green : color.red, text_color=color.white)
+    
+    table.cell(info_table, 0, 4, "Breakout", text_color=color.white)
+    table.cell(info_table, 1, 4, in_breakout ? "ACTIVE" : "NONE", 
+               bgcolor=in_breakout ? color.blue : color.gray, text_color=color.white)
+    
+    table.cell(info_table, 0, 5, "R:R Ratio", text_color=color.white)
+    table.cell(info_table, 1, 5, str.tostring(rr_ratio, "#.#") + ":1", 
+               bgcolor=color.purple, text_color=color.white)

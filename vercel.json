@@ -1,3 +1,4 @@
 {
-  "rootDirectory": "2.7"
+  "rootDirectory": "2.7",
+  "regions": ["fra1"]
 }
